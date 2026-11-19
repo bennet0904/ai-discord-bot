@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+data/
+plugins/*
+!plugins/example_server_stats.py
