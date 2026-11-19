@@ -1,12 +1,14 @@
 # AI Discord Admin Bot
 
-A Discord bot that lets you run your server by chatting with an LLM.
+A Discord bot that lets server owners run their server by chatting with an LLM.
 
-When the bot joins a server it creates a private channel (`#ai-console` by default) that only the server owner can see. Every message written there goes to the LLM, which can then act on the server through tools. You can ask it things like "create a category called Gaming with two text channels and one voice channel", "make a Moderator role in blue that can kick and time out members" or "delete all channels that start with test". The owner can give other people access to the console.
+When the bot joins a server it creates a private channel (`#ai-console` by default) that only the server owner can see. Every message written there goes to the LLM, which acts on the server through tools. You can ask it things like "create a category called Gaming with two text channels and one voice channel", "make a Moderator role in blue that can kick and time out members" or "delete all channels that start with test". The owner can give other people access to the console.
 
-The assistant can also write new tools for itself in Python. If you ask for something the built-in tools can't do, it writes a tool, saves it to `plugins/` and uses it right away. Those tools are kept across restarts.
+Every server brings its own LLM. The owner connects a model and their own API key with `/ai llm`, so each server pays for its own usage. The bot host doesn't provide any LLM access.
 
-It works with any LLM that [LiteLLM](https://docs.litellm.ai/docs/providers) supports and that can do tool calling. That includes Anthropic, OpenAI, Google Gemini, Mistral, Groq, DeepSeek, xAI, OpenRouter, Azure, AWS Bedrock, Ollama and any OpenAI-compatible server.
+Every server also has its own tools. If you ask for something the built-in tools can't do in one step, the assistant writes a new tool in Python for your server. Other servers never see it. These tools run in an isolated sandbox (see [Security](#security)).
+
+Any provider supported by [LiteLLM](https://docs.litellm.ai/docs/providers) that uses an API key and supports tool calling works. That includes Anthropic, OpenAI, Google Gemini, Mistral, Groq, DeepSeek, xAI, OpenRouter, Azure OpenAI and any OpenAI-compatible server.
 
 ## What it can do
 
@@ -19,19 +21,48 @@ Built-in tools:
 | Roles | `list_roles`, `create_role`, `edit_role`, `delete_role`, `list_permission_names` |
 | Members | `list_members`, `get_member`, `add_roles`, `remove_roles`, `set_nickname`, `timeout_member`, `kick_member`, `ban_user`, `unban_user`, `list_bans` |
 | Messages | `send_message` (with embeds), `read_messages`, `purge_messages`, `create_invite`, `list_emojis` |
-| Self-programming | `create_custom_tool`, `list_custom_tools`, `view_custom_tool`, `delete_custom_tool`, `reload_custom_tools` |
+| Own tools | `create_custom_tool`, `list_custom_tools`, `view_custom_tool`, `delete_custom_tool` |
 
-Destructive tools (deleting channels or roles, kick, ban, timeout, purge, writing code) post an Approve / Deny prompt in the console first. Only the person who asked and the server owner can press the buttons. You can turn this off with `REQUIRE_CONFIRMATION=false`.
+Destructive tools (deleting channels or roles, kick, ban, timeout, purge, writing tools) post an Approve / Deny prompt in the console first. Only the person who asked and the server owner can press the buttons. The bot host can turn this off with `REQUIRE_CONFIRMATION=false`.
 
 Every action shows up in the Discord audit log with the name of the person who asked for it.
 
-## Setup
+## For server owners
+
+1. Invite the bot. The host gives you the link.
+2. Open the new `#ai-console` channel.
+3. Run `/ai llm` and fill in the form:
+   * **Model** in the form `provider/model`, for example `anthropic/claude-sonnet-5-5`, `openai/gpt-4o`, `gemini/gemini-2.5-pro`, `mistral/mistral-large-latest`, `groq/llama-3.3-70b-versatile` or `openrouter/<vendor>/<model>`.
+   * **API key** from your provider.
+   * **API base URL**, only needed for Azure or your own OpenAI-compatible server (then use `openai/<model-name>` as the model).
+
+   The bot sends a short test request before saving. Your key is stored encrypted, is only used for your server, and is never shown again. `/ai llm-remove` deletes it.
+4. Drag the bot's role to the top in **Server Settings → Roles**. Discord doesn't let a bot change roles at or above its own highest role, even with administrator permission.
+5. Start writing in the console.
+
+### Slash commands
+
+| Command | Who | Purpose |
+| --- | --- | --- |
+| `/ai llm` | owner | Connect or change your LLM and API key |
+| `/ai llm-remove` | owner | Delete your LLM settings and key |
+| `/ai grant @user` | owner | Give someone access to the console |
+| `/ai revoke @user` | owner | Remove access |
+| `/ai users` | console users | Show who has access |
+| `/ai tools` | console users | List this server's custom tools |
+| `/ai tool-delete` | owner | Delete a custom tool |
+| `/ai reset` | console users | Clear the conversation memory |
+| `/ai status` | console users | Show model, tools and settings |
+| `/ai setup` | owner | Create the console channel again or repair its permissions |
+
+## For the bot host
 
 ### 1. Create the Discord application
 
 1. Go to the [Discord Developer Portal](https://discord.com/developers/applications) and create a new application.
 2. Open **Bot**, click **Reset Token** and copy the token.
 3. On the same page enable both **Privileged Gateway Intents**: **Server Members Intent** and **Message Content Intent**.
+4. If other people should be able to add the bot, leave **Public Bot** enabled.
 
 ### 2. Configure
 
@@ -39,23 +70,17 @@ Every action shows up in the Discord audit log with the name of the person who a
 cp .env.example .env
 ```
 
-Fill in at least `DISCORD_TOKEN`, `LLM_MODEL` and the API key of your provider. Some examples for `LLM_MODEL`:
-
-```
-anthropic/claude-sonnet-5-5
-openai/gpt-4o
-gemini/gemini-2.5-pro
-mistral/mistral-large-latest
-groq/llama-3.3-70b-versatile
-openrouter/<vendor>/<model>
-ollama_chat/llama3.1          # together with LLM_API_BASE=http://localhost:11434
-```
-
-For a self-hosted OpenAI-compatible server (LM Studio, vLLM, LocalAI) use `openai/<model-name>` and set `LLM_API_BASE` and, if needed, `LLM_API_KEY`.
+Only `DISCORD_TOKEN` is required. Set `ENCRYPTION_KEY` as well, or back up `data/secret.key` once it has been generated. Without that key, the saved API keys can't be decrypted and every server has to enter its key again.
 
 ### 3. Run
 
-With Python 3.10 or newer:
+Docker is the recommended way, because it gives the sandbox an extra layer of protection (see below):
+
+```bash
+docker compose up -d --build
+```
+
+Without Docker (Python 3.10 or newer, Linux or macOS for custom tools):
 
 ```bash
 python -m venv .venv
@@ -64,58 +89,47 @@ pip install -r requirements.txt
 python -m bot
 ```
 
-Or with Docker:
+On startup the bot logs an invite link that asks for administrator permission. Share it with the server owners who should use the bot.
 
-```bash
-docker compose up -d --build
-```
+## Security
 
-On startup the bot logs an invite link that asks for administrator permission. Open it and add the bot to your server. The console channel is created right away and the owner gets a welcome message there.
+Several servers share one bot process, and their owners don't trust each other. So the bot is built to keep them apart.
 
-### 4. Role hierarchy
+**API keys**
+* Keys are encrypted with Fernet before they are written to disk, and they are never shown in Discord or written to the logs.
+* LLM keys in the host's environment (`OPENAI_API_KEY`, AWS and Azure credentials and so on) are removed at startup. Every request passes the server's own key explicitly, so a server without a key can't fall back to the host's.
+* Providers that use the host's cloud credentials instead of an API key (Bedrock, SageMaker, Vertex AI) are refused.
+* The API base URL can't point to private, local or link-local addresses, so nobody can use the bot to reach the host's internal network or cloud metadata. A host who runs the bot only for themselves can allow this with `ALLOW_PRIVATE_API_BASE=true`, for example to use a local Ollama.
 
-Discord doesn't let a bot change roles that are at or above its own highest role, even with administrator permission. Open **Server Settings → Roles** and drag the bot's role to the top if it should be able to manage every role.
+**Custom tools** are code written by an LLM on behalf of someone you may not know. That code never runs inside the bot process. Each call starts a separate Python process that, before running the tool:
 
-## Slash commands
+* starts with an empty environment, so the Discord token and keys are not there,
+* switches to the `nobody` user when the bot runs as root (the default in Docker), so it can't read the data folder or signal the bot,
+* gets limits on CPU time, memory and process count, and file writes are forbidden,
+* pins its file descriptor table, so the operating system refuses to open any file or socket,
+* installs an audit hook that blocks process, signal, file system, network and `ctypes` operations,
+* only lets the code import a small list of pure standard library modules.
 
-| Command | Who | Purpose |
-| --- | --- | --- |
-| `/ai setup` | owner | Create the console channel again or repair its permissions |
-| `/ai grant @user` | owner | Give someone access to the console |
-| `/ai revoke @user` | owner | Remove access |
-| `/ai users` | console users | Show who has access |
-| `/ai model [name]` | owner to change, users to view | Use a different LLM on this server (`default` resets it) |
-| `/ai reset` | console users | Clear the conversation memory |
-| `/ai status` | console users | Show model, tools and settings |
+The tool can only reach Discord by calling built-in tools (`await ctx.call("create_role", {...})`). Those calls are executed by the bot, limited to the server the tool belongs to, and destructive ones still ask for approval. Each run also has a time limit and a maximum number of calls.
 
-## Custom tools (self-programming)
+No sandbox is perfect. If you don't need this feature, set `ENABLE_CUSTOM_TOOLS=false`. If you run the bot without Docker as a normal user, the sandbox can't switch users, so the remaining protection is the descriptor and audit hook layers.
 
-When the assistant creates a tool, it writes a file like this to `plugins/`:
+**Server access**: anyone with console access can do almost anything to the server that an administrator can. Only grant access to people you trust.
+
+## Custom tools
+
+A custom tool is stored as `data/tools/<server id>/<name>.json` and contains a description, a JSON schema for its arguments and code like this:
 
 ```python
-TOOL_SPEC = {
-    "name": "count_bots",
-    "description": "Count the bots on the server.",
-    "parameters": {"type": "object", "properties": {}},
-    "destructive": False,
-}
-
 async def run(ctx, args):
-    return sum(m.bot for m in ctx.guild.members)
+    created = []
+    for name in args["names"]:
+        result = await ctx.call("create_role", {"name": name, "color": args.get("color")})
+        created.append(result["created"]["name"])
+    return f"Created {len(created)} roles: {', '.join(created)}"
 ```
 
-`ctx` gives access to `ctx.bot`, `ctx.guild`, `ctx.channel`, `ctx.author`, `ctx.reason` and the helpers `ctx.find_channel()`, `ctx.find_role()`, `await ctx.find_member()` and `await ctx.find_target()`. You can also write or edit these files by hand and then ask the assistant to run `reload_custom_tools`, or restart the bot. `plugins/example_server_stats.py` is a working example.
-
-### Security
-
-Custom tools are real Python code that runs inside the bot process with full access to the host and to the bot token. For that reason:
-
-* Only the **bot owner** can trigger code creation. By default that is the owner of the Discord application (or its team members). You can set other ids with `BOT_OWNER_IDS`. A server owner who is not the bot owner never sees these tools.
-* Each new or changed tool needs approval through the Approve / Deny buttons, unless confirmations are turned off.
-* Custom tools are global. A tool written on one server is available on every server the bot is in.
-* If other people run the bot on servers you don't trust, or you don't want this feature at all, set `ENABLE_CUSTOM_TOOLS=false`.
-
-Also keep in mind that anyone with console access can do almost anything to the server that an administrator can, so only grant access to people you trust.
+Inside a tool, `ctx.call(tool, args)` runs a built-in tool and returns its result. `ctx.guild_id`, `ctx.guild_name`, `ctx.author_id` and `ctx.author_name` describe the request. `print()` output is returned to the assistant as logs. A failed call raises `ToolCallError`.
 
 ## Configuration reference
 
@@ -124,18 +138,24 @@ All settings are environment variables (see `.env.example`).
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | | Bot token (required) |
-| `LLM_MODEL` | | LiteLLM model string (required) |
-| `LLM_API_KEY`, `LLM_API_BASE` | | Override key and endpoint |
-| `LLM_TEMPERATURE`, `LLM_MAX_TOKENS` | provider default | Sampling settings |
+| `ENCRYPTION_KEY` | generated in `data/secret.key` | Key for encrypting stored API keys |
+| `ALLOW_PRIVATE_API_BASE` | `false` | Allow LLM endpoints on private or local addresses |
 | `CONSOLE_CHANNEL_NAME` | `ai-console` | Name of the private channel |
 | `REQUIRE_CONFIRMATION` | `true` | Approve / Deny buttons for destructive tools |
-| `ENABLE_CUSTOM_TOOLS` | `true` | Allow self-programming |
 | `SHOW_TOOL_CALLS` | `true` | Post a short line for every tool call |
 | `MAX_TOOL_ROUNDS` | `20` | Max LLM round trips per message |
 | `MAX_HISTORY_MESSAGES` | `60` | Conversation memory per server |
-| `BOT_OWNER_IDS` | application owner | Who may create custom tools |
-| `SYSTEM_PROMPT_EXTRA` | | Extra instructions for the assistant |
-| `DATA_DIR`, `PLUGINS_DIR` | `data`, `plugins` | Storage locations |
+| `LLM_TIMEOUT_SECONDS` | `180` | Timeout per LLM request |
+| `SYSTEM_PROMPT_EXTRA` | | Extra instructions for the assistant on every server |
+| `ENABLE_CUSTOM_TOOLS` | `true` | Allow servers to have their own tools |
+| `MAX_CUSTOM_TOOLS` | `50` | Custom tools per server |
+| `MAX_CUSTOM_TOOL_CODE_CHARS` | `20000` | Max code size per tool |
+| `SANDBOX_CPU_SECONDS` | `10` | CPU time per tool run |
+| `SANDBOX_MEMORY_MB` | `512` | Memory per tool run |
+| `SANDBOX_TIMEOUT_SECONDS` | `600` | Total time per tool run, including approvals |
+| `SANDBOX_MAX_CALLS` | `100` | Built-in tool calls per run |
+| `SANDBOX_MAX_PARALLEL` | `4` | Tool runs at the same time across all servers |
+| `DATA_DIR` | `data` | Storage location |
 
 ## Project layout
 
@@ -144,20 +164,24 @@ bot/
   __main__.py       entry point (python -m bot)
   client.py         discord.py bot and events
   agent.py          LLM loop, tool execution, confirmations
+  llm.py            per-server LLM settings, validation and calls
+  crypto.py         encryption of stored API keys
   console.py        private console channel and access list
-  commands.py       /ai slash commands
+  commands.py       /ai slash commands and the LLM form
   storage.py        JSON persistence (data/)
   ui.py             buttons and message splitting
   tools/
     base.py         Tool type, ToolContext and lookups
     builtin.py      Discord tools
     meta.py         tools for writing tools
-    custom.py       loading and saving plugins/
-plugins/            tools written by the assistant
+    custom.py       per-server tool storage
+  sandbox/
+    host.py         starts sandbox processes and relays tool calls
+    runner.py       the locked-down process that runs custom tool code
 ```
 
 ## Notes
 
 * Conversation history is stored per server in `data/history/`. Use `/ai reset` when the assistant gets confused or when you start a new topic.
-* If you delete the console channel, it is recreated on the next restart or with `/ai setup`. To get rid of it for good, remove the bot from the server.
-* The bot has to be able to see the console channel, so don't remove its permission overwrite there.
+* When the bot is removed from a server, that server's settings, API key, history and custom tools are deleted.
+* If the console channel is deleted, it is recreated on the next restart or with `/ai setup`.

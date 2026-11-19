@@ -6,7 +6,7 @@ import logging
 import os
 
 from .client import AIBot
-from .config import Config
+from .config import Config, strip_ambient_llm_credentials
 
 
 def main() -> None:
@@ -17,7 +17,13 @@ def main() -> None:
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    os.umask(0o077)  # data files (API keys, history) readable by the bot user only
     config = Config.from_env()
+    removed = strip_ambient_llm_credentials()
+    if removed:
+        logging.getLogger("bot").warning(
+            "Ignoring host LLM credentials %s: every server has to bring its own key.", ", ".join(sorted(removed))
+        )
     bot = AIBot(config)
     bot.run(config.discord_token, log_handler=None)
 

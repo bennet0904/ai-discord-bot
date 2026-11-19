@@ -28,7 +28,6 @@ class Tool:
     parameters: dict
     handler: Handler
     destructive: bool = False
-    bot_owner_only: bool = False
     source: str = "builtin"  # "builtin" or "custom"
 
     def schema(self) -> dict:
@@ -71,16 +70,9 @@ def string_list(description: str) -> dict:
 
 @dataclass
 class ToolContext:
-    """Everything a tool needs to act on the server.
+    """Everything a built-in tool needs to act on the server.
 
-    Custom tools receive this object as `ctx`. Useful attributes:
-      ctx.bot      the running discord.py bot (commands.Bot subclass)
-      ctx.guild    the discord.Guild the console belongs to
-      ctx.channel  the console channel the request came from
-      ctx.author   the discord.Member who sent the request
-      ctx.reason   a string to pass as `reason=` for the audit log
-    Helpers: ctx.find_channel(ref), ctx.find_role(ref), await ctx.find_member(ref),
-    await ctx.find_target(ref) (role or member).
+    Custom tools never see this object, they run in the sandbox and get a restricted proxy instead.
     """
 
     bot: "AIBot"

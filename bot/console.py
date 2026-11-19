@@ -32,16 +32,20 @@ BOT_ACCESS = discord.PermissionOverwrite(
 
 WELCOME = """👋 Hi {owner}, this is your private **AI console** for **{guild}**.
 
-Every message you write here goes to the AI assistant (`{model}`), which can manage this server for you: \
+Every message you write here goes to an AI assistant that can manage this server for you: \
 create and delete channels and roles, set permissions, moderate members, post announcements and more. \
 {custom}
 
+**First step:** connect your own LLM with `/ai llm`. You enter a model (for example `anthropic/claude-sonnet-5-5`, \
+`openai/gpt-4o` or `gemini/gemini-2.5-pro`) and your own API key. The key is stored encrypted and only used for this server.
+
 **Commands**
-`/ai grant @user` give someone else access to this console (owner only)
-`/ai revoke @user` remove access (owner only)
+`/ai llm` connect or change your LLM (owner only)
+`/ai llm-remove` delete your LLM settings and key (owner only)
+`/ai grant @user` / `/ai revoke @user` manage who can use this console (owner only)
 `/ai users` show who has access
+`/ai tools` / `/ai tool-delete` view or remove custom tools
 `/ai reset` clear the conversation memory
-`/ai model` show or change the LLM for this server (owner only)
 `/ai status` show the current configuration
 `/ai setup` recreate or repair this channel (owner only)
 
@@ -102,17 +106,16 @@ async def ensure_console(bot: "AIBot", guild: discord.Guild) -> discord.TextChan
         WELCOME.format(
             owner=owner.mention if owner else "there",
             guild=guild.name,
-            model=bot.storage.guild(guild.id).model or cfg.llm_model,
             custom=(
-                "It can also **program new tools for itself** in Python when you ask for something it cannot do yet "
-                "(only the bot's owner can trigger this)."
+                "When you ask for something it cannot do yet, it can **write its own tools** for this server. "
+                "They run in an isolated sandbox."
                 if cfg.enable_custom_tools
                 else ""
             ),
             confirm=(
-                "Destructive actions (deleting, kicking, banning, writing code) need your approval via buttons."
+                "Destructive actions (deleting, kicking, banning, writing tools) need your approval via buttons."
                 if cfg.require_confirmation
-                else "⚠️ Confirmations are disabled: the assistant acts immediately, including destructive actions."
+                else "⚠️ Confirmations are disabled on this bot: the assistant acts immediately, including destructive actions."
             ),
         ),
         allowed_mentions=discord.AllowedMentions(users=True),

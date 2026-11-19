@@ -11,8 +11,11 @@ from .agent import Agent
 from .commands import AdminCog
 from .config import Config
 from .console import can_use_console, ensure_console
+from .crypto import KeyBox
+from .sandbox.host import SUPPORTED as SANDBOX_SUPPORTED
+from .sandbox.host import Sandbox
 from .storage import Storage
-from .tools import CustomToolManager, ToolRegistry
+from .tools import CustomToolStore, ToolRegistry
 
 log = logging.getLogger(__name__)
 
@@ -22,19 +25,28 @@ class AIBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.members = True
-        options = {"owner_ids": config.bot_owner_ids} if config.bot_owner_ids else {}
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=intents,
             help_command=None,
             allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
-            **options,
         )
+        if config.enable_custom_tools and not SANDBOX_SUPPORTED:
+            log.warning("Custom tools need Linux or macOS for the sandbox; they are disabled on this system.")
+            config.enable_custom_tools = False
         self.config = config
         self.storage = Storage(config.data_dir)
-        self.custom_tools = CustomToolManager(config.plugins_dir)
-        self.registry = ToolRegistry(self.custom_tools, enable_custom_tools=config.enable_custom_tools)
+        self.keybox = KeyBox(config.data_dir, config.encryption_key)
+        self.sandbox = Sandbox(
+            cpu_seconds=config.sandbox_cpu_seconds,
+            memory_mb=config.sandbox_memory_mb,
+            wall_seconds=config.sandbox_timeout_seconds,
+            max_calls=config.sandbox_max_calls,
+            max_parallel=config.sandbox_max_parallel,
+        )
         self.agent = Agent(self)
+        self.custom_tools = CustomToolStore(config.data_dir / "tools", self.agent.make_custom_handler)
+        self.registry = ToolRegistry(config, self.custom_tools, enable_custom_tools=config.enable_custom_tools)
 
     async def setup_hook(self) -> None:
         await self.add_cog(AdminCog(self))
@@ -50,7 +62,8 @@ class AIBot(commands.Bot):
         )
         log.info("Logged in as %s (%s) in %d guild(s)", self.user, self.user.id, len(self.guilds))
         log.info("Invite URL: %s", invite)
-        log.info("Model: %s | tools: %d", self.config.llm_model, len(self.registry.all()))
+        log.info("Built-in tools: %d | custom tools: %s", len(self.registry.builtin),
+                 "on" if self.config.enable_custom_tools else "off")
         for guild in self.guilds:
             await self._setup_guild(guild)
 
@@ -69,6 +82,7 @@ class AIBot(commands.Bot):
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         log.info("Removed from guild %s (%s)", guild.name, guild.id)
         self.storage.forget_guild(guild.id)
+        self.custom_tools.forget_guild(guild.id)
 
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
         settings = self.storage.guild(channel.guild.id)

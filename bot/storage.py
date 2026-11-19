@@ -14,7 +14,9 @@ from typing import Any
 class GuildSettings:
     console_channel_id: int | None = None
     allowed_user_ids: list[int] = field(default_factory=list)
-    model: str | None = None
+    llm_model: str | None = None
+    llm_api_key_encrypted: str | None = None
+    llm_api_base: str | None = None
 
 
 def _atomic_write(path: Path, data: Any) -> None:
@@ -49,7 +51,9 @@ class Storage:
             self._settings[int(guild_id)] = GuildSettings(
                 console_channel_id=values.get("console_channel_id"),
                 allowed_user_ids=[int(u) for u in values.get("allowed_user_ids", [])],
-                model=values.get("model"),
+                llm_model=values.get("llm_model"),
+                llm_api_key_encrypted=values.get("llm_api_key_encrypted"),
+                llm_api_base=values.get("llm_api_base"),
             )
 
     def _save_settings(self) -> None:

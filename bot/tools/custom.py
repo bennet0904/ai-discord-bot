@@ -1,163 +1,128 @@
-"""Custom tools the LLM writes for itself.
+"""Per-server custom tools written by the LLM.
 
-Each custom tool is a Python file in the plugins directory that looks like:
+Each server has its own folder `data/tools/<guild_id>/` with one JSON file per tool:
 
-    TOOL_SPEC = {
-        "name": "...",
-        "description": "...",
-        "parameters": {...JSON schema...},
-        "destructive": False,
-    }
+    {"name": ..., "description": ..., "parameters": {...}, "destructive": false,
+     "code": "async def run(ctx, args): ...", "author_id": 123, "updated_at": "..."}
 
-    async def run(ctx, args):
-        ...
-        return "result"
-
-`ctx` is a bot.tools.base.ToolContext, `args` a dict matching the parameters schema.
+The code is never imported into the bot process. It only runs inside the sandbox (bot.sandbox).
 """
 
 from __future__ import annotations
 
 import ast
-import importlib.util
-import inspect
+import datetime as dt
+import json
 import logging
-import pprint
 import re
-import sys
+import shutil
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Callable
 
 from .base import Tool, ToolError
 
 log = logging.getLogger(__name__)
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,47}$")
-MODULE_PREFIX = "ai_custom_tool_"
 
 
-def _validate_spec(spec: dict) -> None:
-    if not isinstance(spec, dict):
-        raise ToolError("TOOL_SPEC must be a dict.")
-    name = spec.get("name")
+@dataclass
+class CustomToolRecord:
+    name: str
+    description: str
+    parameters: dict
+    destructive: bool
+    code: str
+    author_id: int | None = None
+    updated_at: str | None = None
+
+
+def validate_definition(name: str, description: str, parameters: dict, code: str, max_code_chars: int) -> None:
     if not isinstance(name, str) or not NAME_RE.match(name):
-        raise ToolError("Tool name must be snake_case, 2-48 chars, start with a letter.")
-    if not isinstance(spec.get("description"), str) or not spec["description"].strip():
-        raise ToolError("Tool needs a non-empty description.")
-    parameters = spec.get("parameters")
+        raise ToolError("Tool name must be snake_case, 2-48 chars, starting with a letter.")
+    if not isinstance(description, str) or not description.strip():
+        raise ToolError("The tool needs a description.")
     if not isinstance(parameters, dict) or parameters.get("type") != "object":
         raise ToolError("parameters must be a JSON schema with type 'object'.")
-
-
-def _load_file(path: Path) -> Tool:
-    module_name = MODULE_PREFIX + path.stem
-    sys.modules.pop(module_name, None)
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    if spec is None or spec.loader is None:
-        raise ToolError(f"Cannot import {path}.")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
+    if not isinstance(code, str) or not code.strip():
+        raise ToolError("The tool needs code.")
+    if len(code) > max_code_chars:
+        raise ToolError(f"Code is too long ({len(code)} chars, limit {max_code_chars}).")
     try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(module_name, None)
-        raise
-
-    tool_spec = getattr(module, "TOOL_SPEC", None)
-    _validate_spec(tool_spec)
-    run = getattr(module, "run", None)
-    if run is None or not inspect.iscoroutinefunction(run):
-        raise ToolError("The code must define `async def run(ctx, args)`.")
-
-    async def handler(ctx, args, _run=run):
-        return await _run(ctx, args)
-
-    return Tool(
-        name=tool_spec["name"],
-        description=tool_spec["description"],
-        parameters=tool_spec["parameters"],
-        handler=handler,
-        destructive=bool(tool_spec.get("destructive", False)),
-        source="custom",
-    )
+        tree = ast.parse(code)  # parsing only, the code is never executed here
+    except SyntaxError as exc:
+        raise ToolError(f"Syntax error in code: {exc}") from None
+    if not any(isinstance(node, ast.AsyncFunctionDef) and node.name == "run" for node in tree.body):
+        raise ToolError("The code must define a top-level `async def run(ctx, args)`.")
 
 
-class CustomToolManager:
-    def __init__(self, directory: Path):
-        self.directory = directory
-        self.tools: dict[str, Tool] = {}
-        self.errors: dict[str, str] = {}
+class CustomToolStore:
+    def __init__(self, root: Path, make_handler: Callable[[CustomToolRecord], Callable]):
+        self.root = root
+        self._make_handler = make_handler
+        self._cache: dict[int, dict[str, CustomToolRecord]] = {}
 
-    def path_for(self, name: str) -> Path:
-        return self.directory / f"{name}.py"
+    def _dir(self, guild_id: int) -> Path:
+        return self.root / str(int(guild_id))
 
-    def load_all(self, reserved: set[str]) -> None:
-        self.tools.clear()
-        self.errors.clear()
-        if not self.directory.exists():
-            return
-        for path in sorted(self.directory.glob("*.py")):
-            if path.name.startswith("_"):
-                continue
-            try:
-                tool = _load_file(path)
-                if tool.name in reserved:
-                    raise ToolError(f"name {tool.name!r} collides with a built-in tool")
-                if tool.name != path.stem:
-                    raise ToolError(f"TOOL_SPEC name {tool.name!r} does not match file name {path.stem!r}")
-                self.tools[tool.name] = tool
-                log.info("Loaded custom tool %s", tool.name)
-            except Exception as exc:  # noqa: BLE001 - a broken plugin must not stop the bot
-                self.errors[path.stem] = f"{type(exc).__name__}: {exc}"
-                log.warning("Failed to load custom tool %s: %s", path, exc)
+    def records(self, guild_id: int) -> dict[str, CustomToolRecord]:
+        if guild_id not in self._cache:
+            records: dict[str, CustomToolRecord] = {}
+            directory = self._dir(guild_id)
+            if directory.exists():
+                for path in sorted(directory.glob("*.json")):
+                    try:
+                        data = json.loads(path.read_text(encoding="utf-8"))
+                        records[data["name"]] = CustomToolRecord(**data)
+                    except Exception as exc:  # noqa: BLE001 - skip a broken file, keep the rest
+                        log.warning("Skipping broken custom tool file %s: %s", path, exc)
+            self._cache[guild_id] = records
+        return self._cache[guild_id]
 
-    @staticmethod
-    def render_source(name: str, description: str, parameters: dict, destructive: bool, code: str) -> str:
-        spec = {"name": name, "description": description, "parameters": parameters, "destructive": destructive}
-        header = (
-            "# Custom tool written by the AI console. Loaded automatically on startup.\n"
-            f"TOOL_SPEC = {pprint.pformat(spec, sort_dicts=False, width=100)}\n\n"
+    def tools(self, guild_id: int) -> list[Tool]:
+        return [self.to_tool(r) for r in self.records(guild_id).values()]
+
+    def to_tool(self, record: CustomToolRecord) -> Tool:
+        return Tool(
+            name=record.name,
+            description=f"[custom tool] {record.description}",
+            parameters=record.parameters,
+            handler=self._make_handler(record),
+            destructive=record.destructive,
+            source="custom",
         )
-        return header + code.strip() + "\n"
 
-    def save(self, name: str, description: str, parameters: dict, destructive: bool, code: str, reserved: set[str]) -> Tool:
-        if name in reserved:
-            raise ToolError(f"{name!r} is a built-in tool name.")
-        _validate_spec({"name": name, "description": description, "parameters": parameters})
-        source = self.render_source(name, description, parameters, destructive, code)
-        try:
-            tree = ast.parse(source)
-        except SyntaxError as exc:
-            raise ToolError(f"Syntax error in code: {exc}") from None
-        if not any(isinstance(n, ast.AsyncFunctionDef) and n.name == "run" for n in tree.body):
-            raise ToolError("The code must define a top-level `async def run(ctx, args)`.")
+    def get(self, guild_id: int, name: str) -> CustomToolRecord:
+        record = self.records(guild_id).get(name)
+        if record is None:
+            raise ToolError(f"No custom tool named {name!r} on this server.")
+        return record
 
-        self.directory.mkdir(parents=True, exist_ok=True)
-        path = self.path_for(name)
-        previous = path.read_text(encoding="utf-8") if path.exists() else None
-        path.write_text(source, encoding="utf-8")
-        try:
-            tool = _load_file(path)
-        except Exception as exc:
-            if previous is None:
-                path.unlink(missing_ok=True)
-            else:
-                path.write_text(previous, encoding="utf-8")
-            raise ToolError(f"Tool failed to load, nothing was saved: {type(exc).__name__}: {exc}") from None
-        self.tools[name] = tool
-        self.errors.pop(name, None)
-        return tool
+    def save(self, guild_id: int, record: CustomToolRecord, *, reserved: set[str], max_tools: int, max_code_chars: int) -> bool:
+        """Validate and store a tool. Returns True if an existing tool was replaced."""
+        if record.name in reserved:
+            raise ToolError(f"{record.name!r} is a built-in tool name.")
+        validate_definition(record.name, record.description, record.parameters, record.code, max_code_chars)
+        records = self.records(guild_id)
+        existed = record.name in records
+        if not existed and len(records) >= max_tools:
+            raise ToolError(f"This server already has {max_tools} custom tools. Delete one first.")
+        record.updated_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        directory = self._dir(guild_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{record.name}.json"
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(asdict(record), indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        records[record.name] = record
+        return existed
 
-    def delete(self, name: str) -> None:
-        path = self.path_for(name)
-        if not path.exists():
-            raise ToolError(f"No custom tool named {name!r}.")
-        path.unlink()
-        self.tools.pop(name, None)
-        self.errors.pop(name, None)
-        sys.modules.pop(MODULE_PREFIX + name, None)
+    def delete(self, guild_id: int, name: str) -> None:
+        self.get(guild_id, name)
+        (self._dir(guild_id) / f"{name}.json").unlink(missing_ok=True)
+        self.records(guild_id).pop(name, None)
 
-    def source(self, name: str) -> str:
-        path = self.path_for(name)
-        if not path.exists():
-            raise ToolError(f"No custom tool named {name!r}.")
-        return path.read_text(encoding="utf-8")
+    def forget_guild(self, guild_id: int) -> None:
+        self._cache.pop(guild_id, None)
+        shutil.rmtree(self._dir(guild_id), ignore_errors=True)

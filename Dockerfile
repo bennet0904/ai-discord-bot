@@ -7,9 +7,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot ./bot
-COPY plugins ./plugins
 
-# data/ holds settings and history, plugins/ holds tools the assistant writes.
-VOLUME ["/app/data", "/app/plugins"]
+# Holds server settings, encrypted API keys, history and custom tools.
+VOLUME ["/app/data"]
 
+# The bot runs as root inside the container on purpose: the sandbox process for
+# custom tools then switches to the unprivileged "nobody" user before running
+# any untrusted code, so it can neither read the data folder nor signal the bot.
 CMD ["python", "-m", "bot"]

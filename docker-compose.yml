@@ -5,4 +5,10 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
-      - ./plugins:/app/plugins
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true

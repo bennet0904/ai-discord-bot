@@ -10,18 +10,16 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 import discord
-import litellm
 
-from .tools import Tool, ToolContext, ToolError
+from . import llm
+from .sandbox.host import SandboxError
+from .tools import CustomToolRecord, Tool, ToolContext, ToolError
 from .ui import ConfirmView, send_long
 
 if TYPE_CHECKING:
     from .client import AIBot
 
 log = logging.getLogger(__name__)
-
-litellm.drop_params = True  # silently drop params a provider does not support
-litellm.suppress_debug_info = True
 
 TOOL_TIMEOUT_SECONDS = 120
 MAX_TOOL_RESULT_CHARS = 12000
@@ -39,8 +37,13 @@ How to work:
 {custom_tools_section}
 The server owner is {owner}. The current speaker is given at the start of every user message.{extra}"""
 
-CUSTOM_TOOLS_SECTION = """- You can extend yourself: when a task needs something the built-in tools cannot do (scheduled behaviour aside), write a new tool with create_custom_tool. Test it by calling it afterwards. Prefer small, focused tools. Existing custom tools: {names}.
+CUSTOM_TOOLS_SECTION = """- You can extend yourself: when a task needs logic the built-in tools cannot do in one step, write a tool for this server with create_custom_tool, then call it to test it. Custom tools run in a sandbox and act on Discord by calling your built-in tools. This server's custom tools: {names}.
 """
+
+NO_LLM_MESSAGE = (
+    "⚙️ No LLM is connected to this server yet. The server owner has to run `/ai llm` and enter a model and "
+    "their own API key. Supported: {examples}, any OpenAI-compatible server and more."
+)
 
 
 def _trim_history(messages: list[dict], max_messages: int) -> list[dict]:
@@ -66,10 +69,26 @@ def _serialize_result(result: Any) -> str:
     return text or "(empty result)"
 
 
-def _short_args(name: str, args: dict) -> str:
+def _short_args(args: dict) -> str:
     shown = {k: v for k, v in args.items() if k != "code"}
     text = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False)}" for k, v in shown.items())
     return text if len(text) <= 160 else text[:157] + "..."
+
+
+def describe_error(exc: BaseException) -> str:
+    if isinstance(exc, ToolError):
+        return str(exc)
+    if isinstance(exc, discord.Forbidden):
+        return f"Discord refused (missing permissions): {exc.text}. The target may be above the bot's top role."
+    if isinstance(exc, discord.HTTPException):
+        return f"Discord API error {exc.status}: {exc.text}"
+    if isinstance(exc, asyncio.TimeoutError):
+        return f"timed out after {TOOL_TIMEOUT_SECONDS}s"
+    if isinstance(exc, KeyError):
+        return f"missing required argument {exc}"
+    if isinstance(exc, SandboxError):
+        return f"custom tool failed: {exc}"
+    return f"{type(exc).__name__}: {exc}"
 
 
 class Agent:
@@ -77,13 +96,26 @@ class Agent:
         self.bot = bot
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+    # ---- settings ---------------------------------------------------------
+
+    def llm_settings(self, guild_id: int) -> llm.LLMSettings | None:
+        settings = self.bot.storage.guild(guild_id)
+        if not settings.llm_model:
+            return None
+        api_key = None
+        if settings.llm_api_key_encrypted:
+            api_key = self.bot.keybox.decrypt(settings.llm_api_key_encrypted)
+            if api_key is None:
+                return None
+        return llm.LLMSettings(model=settings.llm_model, api_key=api_key, api_base=settings.llm_api_base)
+
     # ---- prompt building --------------------------------------------------
 
     def _system_prompt(self, guild: discord.Guild) -> str:
         cfg = self.bot.config
         section = ""
         if cfg.enable_custom_tools:
-            names = ", ".join(self.bot.custom_tools.tools) or "none yet"
+            names = ", ".join(self.bot.custom_tools.records(guild.id)) or "none yet"
             section = CUSTOM_TOOLS_SECTION.format(names=names)
         extra = f"\n\n{cfg.system_prompt_extra}" if cfg.system_prompt_extra else ""
         owner = guild.owner or guild.get_member(guild.owner_id)
@@ -105,30 +137,12 @@ class Agent:
             text += "\n\nAttachments:\n" + "\n".join(f"- {a.filename}: {a.url}" for a in message.attachments)
         return f"[{author.display_name} | @{author.name} | id {author.id} | {role}]\n{text}"
 
-    # ---- LLM call ---------------------------------------------------------
-
-    async def _complete(self, model: str, messages: list[dict], tools: list[Tool]) -> Any:
-        cfg = self.bot.config
-        kwargs: dict[str, Any] = {"model": model, "messages": messages}
-        if tools:
-            kwargs["tools"] = [t.schema() for t in tools]
-            kwargs["tool_choice"] = "auto"
-        if cfg.llm_api_key:
-            kwargs["api_key"] = cfg.llm_api_key
-        if cfg.llm_api_base:
-            kwargs["api_base"] = cfg.llm_api_base
-        if cfg.llm_temperature is not None:
-            kwargs["temperature"] = cfg.llm_temperature
-        if cfg.llm_max_tokens:
-            kwargs["max_tokens"] = cfg.llm_max_tokens
-        return await litellm.acompletion(**kwargs)
-
     # ---- confirmation -----------------------------------------------------
 
-    async def _confirm(self, ctx: ToolContext, tool: Tool, args: dict) -> bool:
+    async def confirm(self, ctx: ToolContext, tool: Tool, args: dict, note: str | None = None) -> bool:
         embed = discord.Embed(
             title=f"Confirm: {tool.name}",
-            description=tool.description[:300],
+            description=(note + "\n\n" if note else "") + tool.description[:300],
             colour=discord.Colour.orange(),
         )
         file = None
@@ -145,14 +159,48 @@ class Agent:
             for key, value in list(args.items())[:15]:
                 embed.add_field(name=key[:100], value=str(value)[:300] or "-", inline=True)
 
-        allowed = {ctx.author.id, ctx.guild.owner_id}
-        view = ConfirmView(allowed)
+        view = ConfirmView({ctx.author.id, ctx.guild.owner_id})
         kwargs: dict[str, Any] = {"embed": embed, "view": view}
         if file:
             kwargs["file"] = file
         view.message = await ctx.channel.send(**kwargs)
         await view.wait()
         return view.approved
+
+    # ---- custom tools -----------------------------------------------------
+
+    def make_custom_handler(self, record: CustomToolRecord):
+        async def handler(ctx: ToolContext, args: dict) -> Any:
+            return await self.run_custom_tool(ctx, record, args)
+
+        return handler
+
+    async def run_custom_tool(self, ctx: ToolContext, record: CustomToolRecord, args: dict) -> Any:
+        bot = self.bot
+
+        async def on_call(name: str, call_args: dict) -> Any:
+            tool = bot.registry.discord_tools.get(name)
+            if tool is None:
+                raise ToolError(f"Unknown built-in tool {name!r}. Custom tools can only call built-in Discord tools.")
+            if tool.destructive and bot.config.require_confirmation and not record.destructive:
+                note = f"Requested by custom tool `{record.name}`."
+                if not await self.confirm(ctx, tool, call_args, note=note):
+                    raise ToolError("The user denied this action.")
+            try:
+                return await asyncio.wait_for(tool.handler(ctx, call_args), timeout=TOOL_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001
+                raise ToolError(describe_error(exc)) from None
+
+        context = {
+            "guild_id": str(ctx.guild.id),
+            "guild_name": ctx.guild.name,
+            "author_id": str(ctx.author.id),
+            "author_name": str(ctx.author),
+        }
+        out = await bot.sandbox.run(record.code, args, context, on_call)
+        if out.get("logs"):
+            return {"result": out.get("result"), "logs": out["logs"]}
+        return out.get("result")
 
     # ---- tool execution ---------------------------------------------------
 
@@ -168,29 +216,18 @@ class Agent:
             return f"Error: could not parse arguments as JSON ({exc}).", False, {}
 
         if tool.destructive and self.bot.config.require_confirmation:
-            if not await self._confirm(ctx, tool, args):
+            if not await self.confirm(ctx, tool, args):
                 return "The user denied this action. Do not retry it unless they ask again.", False, args
 
+        # Custom tools have their own (longer) sandbox timeout.
+        timeout = None if tool.source == "custom" else TOOL_TIMEOUT_SECONDS
         try:
-            result = await asyncio.wait_for(tool.handler(ctx, args), timeout=TOOL_TIMEOUT_SECONDS)
+            result = await asyncio.wait_for(tool.handler(ctx, args), timeout=timeout)
             return _serialize_result(result), True, args
-        except ToolError as exc:
-            return f"Error: {exc}", False, args
-        except discord.Forbidden as exc:
-            return (
-                f"Error: Discord refused (missing permissions): {exc.text}. The target may be above the bot's top role.",
-                False,
-                args,
-            )
-        except discord.HTTPException as exc:
-            return f"Error: Discord API error {exc.status}: {exc.text}", False, args
-        except asyncio.TimeoutError:
-            return f"Error: tool timed out after {TOOL_TIMEOUT_SECONDS}s.", False, args
-        except KeyError as exc:
-            return f"Error: missing required argument {exc}.", False, args
         except Exception as exc:  # noqa: BLE001 - surface any failure to the model
-            log.exception("Tool %s crashed", name)
-            return f"Error: {type(exc).__name__}: {exc}", False, args
+            if not isinstance(exc, (ToolError, discord.HTTPException, SandboxError, KeyError, asyncio.TimeoutError)):
+                log.exception("Tool %s crashed", name)
+            return f"Error: {describe_error(exc)}", False, args
 
     # ---- main entry -------------------------------------------------------
 
@@ -203,11 +240,12 @@ class Agent:
     async def _handle_locked(self, message: discord.Message, guild: discord.Guild) -> None:
         bot = self.bot
         cfg = bot.config
-        settings = bot.storage.guild(guild.id)
-        model = settings.model or cfg.llm_model
-        author = message.author if isinstance(message.author, discord.Member) else await guild.fetch_member(message.author.id)
+        settings = self.llm_settings(guild.id)
+        if settings is None:
+            await message.channel.send(NO_LLM_MESSAGE.format(examples=llm.MODEL_EXAMPLES))
+            return
 
-        is_bot_owner = await bot.is_owner(author)
+        author = message.author if isinstance(message.author, discord.Member) else await guild.fetch_member(message.author.id)
         ctx = ToolContext(bot=bot, guild=guild, channel=message.channel, author=author)
 
         history = bot.storage.history(guild.id)
@@ -215,15 +253,16 @@ class Agent:
 
         for _round in range(cfg.max_tool_rounds):
             # Tools can be added mid-conversation (create_custom_tool), so rebuild every round.
-            tools = bot.registry.available_for(is_bot_owner=is_bot_owner)
-            allowed = {t.name: t for t in tools}
+            allowed = bot.registry.for_guild(guild.id)
             prompt = [{"role": "system", "content": self._system_prompt(guild)}, *history, *new_messages]
             try:
                 async with message.channel.typing():
-                    response = await self._complete(model, prompt, tools)
+                    response = await llm.complete(
+                        settings, prompt, [t.schema() for t in allowed.values()], cfg.llm_timeout_seconds
+                    )
             except Exception as exc:  # noqa: BLE001
-                log.exception("LLM request failed")
-                await message.channel.send(f"⚠️ LLM request failed ({model}): `{str(exc)[:1500]}`")
+                log.warning("LLM request failed in guild %s: %s", guild.id, type(exc).__name__)
+                await message.channel.send(f"⚠️ LLM request failed ({settings.model}): `{str(exc)[:1500]}`")
                 return  # nothing from this turn is stored, so the history stays consistent
 
             choice = response.choices[0].message
@@ -253,7 +292,7 @@ class Agent:
                 new_messages.append({"role": "tool", "tool_call_id": call.id, "content": result})
                 if cfg.show_tool_calls:
                     mark = "✅" if ok else "❌"
-                    line = f"-# {mark} `{call.function.name}` {_short_args(call.function.name, args)}"
+                    line = f"-# {mark} `{call.function.name}` {_short_args(args)}"
                     if not ok:
                         line += f"\n-# {result[:300]}"
                     await message.channel.send(line[:1990], allowed_mentions=discord.AllowedMentions.none())
