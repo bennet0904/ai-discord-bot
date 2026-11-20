@@ -88,13 +88,45 @@ def _call_kwargs(settings: LLMSettings, timeout: int) -> dict[str, Any]:
     return kwargs
 
 
-async def complete(settings: LLMSettings, messages: list[dict], tools: list[dict] | None, timeout: int) -> Any:
+# Errors that usually go away on their own: overloaded or rate limited provider, network hiccups.
+TRANSIENT_ERRORS: tuple[type[BaseException], ...] = tuple(
+    cls
+    for cls in (
+        getattr(litellm, "ServiceUnavailableError", None),
+        getattr(litellm, "RateLimitError", None),
+        getattr(litellm, "InternalServerError", None),
+        getattr(litellm, "BadGatewayError", None),
+        getattr(litellm, "APIConnectionError", None),
+        getattr(litellm, "Timeout", None),
+    )
+    if isinstance(cls, type)
+)
+RETRY_BASE_DELAY = 3.0
+
+
+async def complete(
+    settings: LLMSettings, messages: list[dict], tools: list[dict] | None, timeout: int, retries: int = 4
+) -> Any:
     kwargs = _call_kwargs(settings, timeout)
     kwargs["messages"] = messages
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
-    return await litellm.acompletion(**kwargs)
+
+    delay = RETRY_BASE_DELAY
+    for attempt in range(retries + 1):
+        try:
+            return await litellm.acompletion(**kwargs)
+        except TRANSIENT_ERRORS as exc:
+            if attempt == retries:
+                raise
+            log.info("LLM busy (%s), retry %d/%d in %.0fs", type(exc).__name__, attempt + 1, retries, delay)
+            await asyncio.sleep(delay)
+            delay *= 2
+
+
+def is_transient(exc: BaseException) -> bool:
+    return isinstance(exc, TRANSIENT_ERRORS)
 
 
 async def test_connection(settings: LLMSettings) -> str:

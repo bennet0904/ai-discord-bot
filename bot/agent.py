@@ -229,6 +229,44 @@ class Agent:
                 log.exception("Tool %s crashed", name)
             return f"Error: {describe_error(exc)}", False, args
 
+    # ---- failures ---------------------------------------------------------
+
+    async def _report_failure(
+        self,
+        message: discord.Message,
+        guild: discord.Guild,
+        settings: llm.LLMSettings,
+        exc: BaseException,
+        history: list[dict],
+        new_messages: list[dict],
+    ) -> None:
+        cfg = self.bot.config
+        did_work = any(m.get("role") == "tool" for m in new_messages)
+        if llm.is_transient(exc):
+            text = (
+                f"⚠️ `{settings.model}` is overloaded or unreachable right now, even after {cfg.llm_retries} retries. "
+                "Try again in a minute, or switch to another model with `/ai llm`."
+            )
+        else:
+            text = f"⚠️ LLM request failed ({settings.model}): `{str(exc)[:1500]}`"
+
+        if did_work:
+            # Keep what was already done so the next message can pick up where this one stopped.
+            # The history ends with tool results, so close the turn with an assistant note.
+            new_messages.append(
+                {
+                    "role": "assistant",
+                    "content": "(I was interrupted by an LLM error before finishing this request. "
+                    "The tool results above show what was already done. If asked to continue, "
+                    "check the current state and do only the remaining steps.)",
+                }
+            )
+            self.bot.storage.set_history(
+                guild.id, _trim_history(history + new_messages, cfg.max_history_messages)
+            )
+            text += "\nThe steps above were already done and are remembered. Write **continue** to finish the rest."
+        await message.channel.send(text)
+
     # ---- main entry -------------------------------------------------------
 
     async def handle(self, message: discord.Message) -> None:
@@ -258,12 +296,16 @@ class Agent:
             try:
                 async with message.channel.typing():
                     response = await llm.complete(
-                        settings, prompt, [t.schema() for t in allowed.values()], cfg.llm_timeout_seconds
+                        settings,
+                        prompt,
+                        [t.schema() for t in allowed.values()],
+                        cfg.llm_timeout_seconds,
+                        retries=cfg.llm_retries,
                     )
             except Exception as exc:  # noqa: BLE001
                 log.warning("LLM request failed in guild %s: %s", guild.id, type(exc).__name__)
-                await message.channel.send(f"⚠️ LLM request failed ({settings.model}): `{str(exc)[:1500]}`")
-                return  # nothing from this turn is stored, so the history stays consistent
+                await self._report_failure(message, guild, settings, exc, history, new_messages)
+                return
 
             choice = response.choices[0].message
             content = (choice.content or "").strip()

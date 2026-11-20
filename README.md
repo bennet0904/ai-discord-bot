@@ -146,6 +146,7 @@ All settings are environment variables (see `.env.example`).
 | `MAX_TOOL_ROUNDS` | `20` | Max LLM round trips per message |
 | `MAX_HISTORY_MESSAGES` | `60` | Conversation memory per server |
 | `LLM_TIMEOUT_SECONDS` | `180` | Timeout per LLM request |
+| `LLM_RETRIES` | `4` | Retries with growing pauses when the provider is overloaded or rate limited |
 | `SYSTEM_PROMPT_EXTRA` | | Extra instructions for the assistant on every server |
 | `ENABLE_CUSTOM_TOOLS` | `true` | Allow servers to have their own tools |
 | `MAX_CUSTOM_TOOLS` | `50` | Custom tools per server |
