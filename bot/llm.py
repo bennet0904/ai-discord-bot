@@ -6,7 +6,7 @@ import asyncio
 import ipaddress
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 import litellm
@@ -101,28 +101,59 @@ TRANSIENT_ERRORS: tuple[type[BaseException], ...] = tuple(
     )
     if isinstance(cls, type)
 )
-RETRY_BASE_DELAY = 3.0
+RETRY_BASE_DELAY = 2.0
+
+
+class LLMCancelled(Exception):
+    """Raised when a waiting request was cancelled with /ai stop."""
+
+
+def retry_delay(retry_number: int, max_delay: float) -> float:
+    """Pause before retry 1, 2, 3, ...: 2s, 4s, 8s, ... doubling up to max_delay."""
+    return min(RETRY_BASE_DELAY * 2 ** (retry_number - 1), max_delay)
+
+
+RetryCallback = Callable[[int, float, BaseException], Awaitable[None]]
 
 
 async def complete(
-    settings: LLMSettings, messages: list[dict], tools: list[dict] | None, timeout: int, retries: int = 4
+    settings: LLMSettings,
+    messages: list[dict],
+    tools: list[dict] | None,
+    timeout: int,
+    retries: int = 4,
+    max_delay: float = 60.0,
+    cancel: asyncio.Event | None = None,
+    on_retry: RetryCallback | None = None,
 ) -> Any:
+    """Call the model. Transient errors are retried `retries` times, or forever if retries < 0."""
     kwargs = _call_kwargs(settings, timeout)
     kwargs["messages"] = messages
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
 
-    delay = RETRY_BASE_DELAY
-    for attempt in range(retries + 1):
+    retry_number = 0
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise LLMCancelled()
         try:
             return await litellm.acompletion(**kwargs)
         except TRANSIENT_ERRORS as exc:
-            if attempt == retries:
+            if 0 <= retries <= retry_number:
                 raise
-            log.info("LLM busy (%s), retry %d/%d in %.0fs", type(exc).__name__, attempt + 1, retries, delay)
-            await asyncio.sleep(delay)
-            delay *= 2
+            retry_number += 1
+            delay = retry_delay(retry_number, max_delay)
+            log.info("LLM busy (%s), retry %d in %.0fs", type(exc).__name__, retry_number, delay)
+            if on_retry is not None:
+                await on_retry(retry_number, delay, exc)
+            if cancel is None:
+                await asyncio.sleep(delay)
+            else:
+                try:
+                    await asyncio.wait_for(cancel.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
 
 
 def is_transient(exc: BaseException) -> bool:

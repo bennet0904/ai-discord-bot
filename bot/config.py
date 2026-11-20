@@ -60,7 +60,8 @@ class Config:
     max_tool_rounds: int = 20
     max_history_messages: int = 60
     llm_timeout_seconds: int = 180
-    llm_retries: int = 4
+    llm_retries: int = 4  # -1 = retry forever
+    llm_retry_max_delay: int = 60
     allow_private_api_base: bool = False
     system_prompt_extra: str = ""
 
@@ -89,6 +90,7 @@ class Config:
             max_history_messages=_int("MAX_HISTORY_MESSAGES", 60),
             llm_timeout_seconds=_int("LLM_TIMEOUT_SECONDS", 180),
             llm_retries=_int("LLM_RETRIES", 4),
+            llm_retry_max_delay=max(1, _int("LLM_RETRY_MAX_DELAY", 60)),
             allow_private_api_base=_bool("ALLOW_PRIVATE_API_BASE", False),
             system_prompt_extra=os.getenv("SYSTEM_PROMPT_EXTRA", ""),
             enable_custom_tools=_bool("ENABLE_CUSTOM_TOOLS", True),

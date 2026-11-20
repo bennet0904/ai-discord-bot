@@ -95,6 +95,15 @@ class Agent:
     def __init__(self, bot: "AIBot"):
         self.bot = bot
         self._locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._cancel: dict[int, asyncio.Event] = {}
+
+    def stop(self, guild_id: int) -> bool:
+        """Cancel the running request of a server. Returns False if nothing is running."""
+        event = self._cancel.get(guild_id)
+        if event is None or event.is_set():
+            return False
+        event.set()
+        return True
 
     # ---- settings ---------------------------------------------------------
 
@@ -242,7 +251,9 @@ class Agent:
     ) -> None:
         cfg = self.bot.config
         did_work = any(m.get("role") == "tool" for m in new_messages)
-        if llm.is_transient(exc):
+        if isinstance(exc, llm.LLMCancelled):
+            text = "⏹️ Request stopped."
+        elif llm.is_transient(exc):
             text = (
                 f"⚠️ `{settings.model}` is overloaded or unreachable right now, even after {cfg.llm_retries} retries. "
                 "Try again in a minute, or switch to another model with `/ai llm`."
@@ -256,7 +267,7 @@ class Agent:
             new_messages.append(
                 {
                     "role": "assistant",
-                    "content": "(I was interrupted by an LLM error before finishing this request. "
+                    "content": "(I was interrupted before finishing this request. "
                     "The tool results above show what was already done. If asked to continue, "
                     "check the current state and do only the remaining steps.)",
                 }
@@ -273,7 +284,42 @@ class Agent:
         guild = message.guild
         assert guild is not None
         async with self._locks[guild.id]:
-            await self._handle_locked(message, guild)
+            self._cancel[guild.id] = asyncio.Event()
+            try:
+                await self._handle_locked(message, guild)
+            finally:
+                self._cancel.pop(guild.id, None)
+
+    def _retry_notifier(self, channel: discord.abc.Messageable, model: str):
+        """Keep one status message up to date while the model is retried, and remove it afterwards."""
+        cfg = self.bot.config
+        state: dict[str, Any] = {"message": None}
+
+        async def on_retry(retry_number: int, delay: float, exc: BaseException) -> None:
+            if retry_number < 2:  # short hiccups stay silent
+                return
+            total = "" if cfg.llm_retries < 0 else f" of {cfg.llm_retries}"
+            text = (
+                f"⏳ `{model}` is overloaded or unreachable. Retry {retry_number}{total}, "
+                f"next attempt in {delay:.0f}s. `/ai stop` cancels the request."
+            )
+            try:
+                if state["message"] is None:
+                    state["message"] = await channel.send(text)
+                else:
+                    await state["message"].edit(content=text)
+            except discord.HTTPException:
+                pass
+
+        async def cleanup() -> None:
+            if state["message"] is not None:
+                try:
+                    await state["message"].delete()
+                except discord.HTTPException:
+                    pass
+                state["message"] = None
+
+        return on_retry, cleanup
 
     async def _handle_locked(self, message: discord.Message, guild: discord.Guild) -> None:
         bot = self.bot
@@ -289,6 +335,9 @@ class Agent:
         history = bot.storage.history(guild.id)
         new_messages: list[dict] = [{"role": "user", "content": self._user_content(message)}]
 
+        cancel = self._cancel.get(guild.id)
+        on_retry, cleanup_status = self._retry_notifier(message.channel, settings.model)
+
         for _round in range(cfg.max_tool_rounds):
             # Tools can be added mid-conversation (create_custom_tool), so rebuild every round.
             allowed = bot.registry.for_guild(guild.id)
@@ -301,11 +350,17 @@ class Agent:
                         [t.schema() for t in allowed.values()],
                         cfg.llm_timeout_seconds,
                         retries=cfg.llm_retries,
+                        max_delay=cfg.llm_retry_max_delay,
+                        cancel=cancel,
+                        on_retry=on_retry,
                     )
             except Exception as exc:  # noqa: BLE001
-                log.warning("LLM request failed in guild %s: %s", guild.id, type(exc).__name__)
+                await cleanup_status()
+                if not isinstance(exc, llm.LLMCancelled):
+                    log.warning("LLM request failed in guild %s: %s", guild.id, type(exc).__name__)
                 await self._report_failure(message, guild, settings, exc, history, new_messages)
                 return
+            await cleanup_status()
 
             choice = response.choices[0].message
             content = (choice.content or "").strip()

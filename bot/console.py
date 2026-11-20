@@ -45,6 +45,7 @@ create and delete channels and roles, set permissions, moderate members, post an
 `/ai grant @user` / `/ai revoke @user` manage who can use this console (owner only)
 `/ai users` show who has access
 `/ai tools` / `/ai tool-delete` view or remove custom tools
+`/ai stop` cancel the running request
 `/ai reset` clear the conversation memory
 `/ai status` show the current configuration
 `/ai setup` recreate or repair this channel (owner only)

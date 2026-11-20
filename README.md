@@ -51,6 +51,7 @@ Every action shows up in the Discord audit log with the name of the person who a
 | `/ai users` | console users | Show who has access |
 | `/ai tools` | console users | List this server's custom tools |
 | `/ai tool-delete` | owner | Delete a custom tool |
+| `/ai stop` | console users | Cancel the running request, for example while it waits for an overloaded model |
 | `/ai reset` | console users | Clear the conversation memory |
 | `/ai status` | console users | Show model, tools and settings |
 | `/ai setup` | owner | Create the console channel again or repair its permissions |
@@ -146,7 +147,8 @@ All settings are environment variables (see `.env.example`).
 | `MAX_TOOL_ROUNDS` | `20` | Max LLM round trips per message |
 | `MAX_HISTORY_MESSAGES` | `60` | Conversation memory per server |
 | `LLM_TIMEOUT_SECONDS` | `180` | Timeout per LLM request |
-| `LLM_RETRIES` | `4` | Retries with growing pauses when the provider is overloaded or rate limited |
+| `LLM_RETRIES` | `4` | Retries when the provider is overloaded or rate limited, `-1` for unlimited |
+| `LLM_RETRY_MAX_DELAY` | `60` | Longest pause between retries in seconds (pauses double from 2s up to this value) |
 | `SYSTEM_PROMPT_EXTRA` | | Extra instructions for the assistant on every server |
 | `ENABLE_CUSTOM_TOOLS` | `true` | Allow servers to have their own tools |
 | `MAX_CUSTOM_TOOLS` | `50` | Custom tools per server |

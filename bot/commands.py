@@ -165,6 +165,17 @@ class AdminCog(commands.Cog):
             "**Console access**\n" + "\n".join(lines), ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
         )
 
+    @ai.command(name="stop", description="Cancel the request the assistant is working on")
+    async def stop(self, interaction: discord.Interaction) -> None:
+        if not await self._require_user(interaction):
+            return
+        if self.bot.agent.stop(interaction.guild.id):
+            await interaction.response.send_message(
+                "⏹️ Stopping. A running tool call finishes first, then the request ends.", ephemeral=True
+            )
+        else:
+            await interaction.response.send_message("Nothing is running right now.", ephemeral=True)
+
     @ai.command(name="reset", description="Clear the assistant's conversation memory")
     async def reset(self, interaction: discord.Interaction) -> None:
         if not await self._require_user(interaction):
